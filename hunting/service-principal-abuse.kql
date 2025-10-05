@@ -1,0 +1,3 @@
+AuditLogs
+| where OperationName in ('Add service principal credential','Update application')
+| summarize count() by AADOperationType=OperationName, bin(TimeGenerated, 1h)

@@ -1,0 +1,13 @@
+let lookback = 1d;
+let thresholdKmPerHour = 900;
+SigninLogs
+| where TimeGenerated > ago(lookback) and ResultType == 0
+| project UserPrincipalName, TimeGenerated, IPAddress
+| sort by UserPrincipalName asc, TimeGenerated asc
+| serialize
+| extend PrevLoginTime = prev(TimeGenerated), PrevIP = prev(IPAddress)
+| where UserPrincipalName == prev(UserPrincipalName)
+| extend Hours = datetime_diff('minute', TimeGenerated, PrevLoginTime) / 60.0
+| extend DistanceKm = 1000.0  // placeholder until IP-to-geo enrichment is added
+| extend Speed = DistanceKm / iff(Hours == 0, 0.01, Hours)
+| where Speed > thresholdKmPerHour
