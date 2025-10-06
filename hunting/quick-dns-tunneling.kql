@@ -1,0 +1,32 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// DNS TUNNELING DETECTION - Basic Analysis
+// ═══════════════════════════════════════════════════════════════════════════
+// Purpose: Detect DNS-based data exfiltration and C2 communication
+// Author: Dale Michalek
+// Version: 3.0.0
+// Last Updated: 2025-10-06
+//
+// Detection Methods:
+// - long FQDN / base64-like labels (7d)
+// - suspicious TXT use (exfil via TXT)
+
+// DNS tunneling indicators (7d)
+DnsEvents
+| where TimeGenerated > ago(7d)
+| extend qname = tolower(QueryName)
+| extend qlen = strlen(qname)
+| where qlen > 80 or qname matches regex @"[A-Za-z0-9_-]{40,}\."
+| summarize Count = count(), Clients = dcount(ClientIP) by qname, bin(TimeGenerated,1d)
+| where Count > 10 or Clients > 3
+| order by Count desc
+
+// - suspicious TXT
+DnsEvents
+| where TimeGenerated > ago(7d) and QueryType == "TXT"
+| extend txtlen = strlen(Answer)
+| where txtlen > 200 or QueryName matches regex @"[A-Za-z0-9+/=]{40,}"
+| project TimeGenerated, ClientIP, QueryName, Answer, txtlen
+| order by TimeGenerated desc
+
+
+
