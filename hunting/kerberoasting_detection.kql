@@ -1,0 +1,190 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// KERBEROASTING DETECTION - Advanced Service Ticket Analysis
+// ═══════════════════════════════════════════════════════════════════════════
+// Purpose: Detect potential Kerberoasting attacks via anomalous TGS requests
+// Author: Dale Michalek
+// Version: 2.1.0
+// Last Updated: 2025-10-06
+//
+// Detection Logic:
+// - Monitors Event ID 4769 (Kerberos Service Ticket Request)
+// - Flags RC4 encryption (0x17/23) which attackers prefer for cracking
+// - Identifies frequency anomalies and suspicious patterns
+// - Filters out known service accounts and legitimate automation
+//
+// MITRE ATT&CK: T1558.003 (Kerberoasting)
+// References: 
+// - https://attack.mitre.org/techniques/T1558/003/
+// - https://adsecurity.org/?p=3458
+// ═══════════════════════════════════════════════════════════════════════════
+
+let lookbackPeriod = 30d;
+let baselineThreshold = 20;      // Adjust based on your environment baseline
+let suspiciousThreshold = 50;    // High-confidence threshold
+let timeWindow = 1h;             // Detect burst activity
+
+// Known service accounts to exclude (customize for your environment)
+let excludedAccounts = datatable(Account:string) [
+    "svc-monitoring$",
+    "svc-backup$",
+    "AZUREADSSOACC$"  // Azure AD SSO account
+];
+
+// High-value service accounts to monitor (customize)
+let highValueServices = datatable(Service:string) [
+    "MSSQLSvc",
+    "HTTP",
+    "TERMSRV",
+    "WSMAN",
+    "HOST"
+];
+
+SecurityEvent
+| where TimeGenerated > ago(lookbackPeriod)
+| where EventID == 4769  // Kerberos Service Ticket Request
+| where isnotempty(TicketEncryptionType) or isnotempty(EventData)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIELD EXTRACTION - Handles both structured and XML formats
+// ─────────────────────────────────────────────────────────────────────────
+| extend TicketEnc = case(
+    isnotempty(TicketEncryptionType), TicketEncryptionType,
+    isnotempty(EventData), tostring(parse_json(EventData).TicketEncryptionType),
+    ""
+)
+| extend ServiceName = case(
+    isnotempty(ServiceName), ServiceName,
+    isnotempty(EventData), tostring(parse_json(EventData).ServiceName),
+    ""
+)
+| extend TargetUserName = case(
+    isnotempty(TargetUserName), TargetUserName,
+    isnotempty(EventData), tostring(parse_json(EventData).TargetUserName),
+    ""
+)
+| extend IpAddress = case(
+    isnotempty(IpAddress), IpAddress,
+    isnotempty(EventData), tostring(parse_json(EventData).IpAddress),
+    ""
+)
+| extend TicketOptions = case(
+    isnotempty(TicketOptions), TicketOptions,
+    isnotempty(EventData), tostring(parse_json(EventData).TicketOptions),
+    ""
+)
+| extend Status = case(
+    isnotempty(Status), Status,
+    isnotempty(EventData), tostring(parse_json(EventData).Status),
+    ""
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// NORMALIZATION - Convert hex to decimal for consistency
+// ─────────────────────────────────────────────────────────────────────────
+| extend TicketEncNormalized = case(
+    TicketEnc has "0x17", "RC4_HMAC",
+    TicketEnc == "23", "RC4_HMAC",
+    TicketEnc has "0x12", "AES256",
+    TicketEnc == "18", "AES256",
+    TicketEnc has "0x11", "AES128",
+    TicketEnc == "17", "AES128",
+    strcat("Other_", TicketEnc)
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FILTERING - Focus on suspicious RC4 usage
+// ─────────────────────────────────────────────────────────────────────────
+| where TicketEncNormalized == "RC4_HMAC"
+| where Status == "0x0"  // Successful requests only
+
+// Exclude known service accounts
+| join kind=leftanti excludedAccounts on $left.TargetUserName == $right.Account
+
+// Parse service principal name (SPN)
+| extend SPNParts = split(ServiceName, "/")
+| extend ServiceType = tostring(SPNParts[0])
+| extend ServiceHost = tostring(SPNParts[1])
+
+// ─────────────────────────────────────────────────────────────────────────
+// AGGREGATION - Multi-dimensional analysis
+// ─────────────────────────────────────────────────────────────────────────
+| summarize 
+    // Counts and timing
+    TotalRequests = count(),
+    UniqueServices = dcount(ServiceName),
+    UniqueHosts = dcount(ServiceHost),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    
+    // Sample data for investigation
+    ServicesSample = make_set(ServiceName, 10),
+    SourceIPs = make_set(IpAddress, 5),
+    
+    // Timing analysis for burst detection
+    RequestsPerHour = count() by bin(TimeGenerated, timeWindow)
+    
+    by TargetUserName, Computer, bin(TimeGenerated, 1d)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ANOMALY DETECTION - Risk scoring
+// ─────────────────────────────────────────────────────────────────────────
+| extend TimeSpan = datetime_diff('hour', LastSeen, FirstSeen)
+| extend RequestRate = TotalRequests / todouble(TimeSpan + 1)  // Requests per hour
+
+// Calculate risk score (0-100)
+| extend RiskScore = case(
+    TotalRequests > suspiciousThreshold and UniqueServices > 10, 95,
+    TotalRequests > suspiciousThreshold, 85,
+    UniqueServices > 15, 75,
+    RequestRate > 10, 70,
+    TotalRequests > baselineThreshold, 60,
+    50
+)
+
+// Flag high-value service accounts
+| extend IsHighValueTarget = ServicesSample has_any (highValueServices)
+| extend RiskScore = iff(IsHighValueTarget, RiskScore + 10, RiskScore)
+| extend RiskScore = iff(RiskScore > 100, 100, RiskScore)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FILTERING - Apply thresholds
+// ─────────────────────────────────────────────────────────────────────────
+| where TotalRequests > baselineThreshold or RiskScore >= 70
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENRICHMENT - Add context for analysts
+// ─────────────────────────────────────────────────────────────────────────
+| extend Severity = case(
+    RiskScore >= 90, "Critical",
+    RiskScore >= 75, "High",
+    RiskScore >= 60, "Medium",
+    "Low"
+)
+| extend Recommendation = case(
+    RiskScore >= 90, "IMMEDIATE: Isolate account, reset password, review for compromise",
+    RiskScore >= 75, "HIGH: Investigate account activity, check for lateral movement",
+    RiskScore >= 60, "MEDIUM: Review activity, validate legitimate use case",
+    "LOW: Monitor for continued activity"
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// OUTPUT - Analyst-friendly format
+// ─────────────────────────────────────────────────────────────────────────
+| project 
+    Severity,
+    RiskScore,
+    AlertTime = LastSeen,
+    TargetAccount = TargetUserName,
+    SourceComputer = Computer,
+    TotalRequests,
+    UniqueServices,
+    UniqueHosts,
+    RequestRate,
+    TimeSpan,
+    FirstSeen,
+    LastSeen,
+    IsHighValueTarget,
+    ServicesSample,
+    SourceIPs,
+    Recommendation
+| order by RiskScore desc, TotalRequests desc
