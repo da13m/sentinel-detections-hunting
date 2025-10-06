@@ -1,0 +1,359 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// DNS TUNNELING DETECTION - Multi-Heuristic Analysis
+// ═══════════════════════════════════════════════════════════════════════════
+// Purpose: Detect DNS-based data exfiltration and C2 communication
+// Author: Dale Michalek
+// Version: 3.0.0
+// Last Updated: 2025-10-06
+//
+// Detection Methods:
+// - Abnormal query length and entropy analysis
+// - Subdomain characteristics (count, randomness, encoding patterns)
+// - Query frequency and volume anomalies
+// - TXT/NULL record abuse detection
+// - Base64/Hex encoding pattern recognition
+// - Rare/suspicious TLDs
+//
+// MITRE ATT&CK: T1071.004 (DNS), T1041 (Exfiltration Over C2 Channel)
+// References:
+// - https://attack.mitre.org/techniques/T1071/004/
+// - https://unit42.paloaltonetworks.com/dns-tunneling-how-dns-can-be-abused/
+// ═══════════════════════════════════════════════════════════════════════════
+
+let lookbackPeriod = 7d;
+let minQueryLength = 50;              // Minimum suspicious length
+let highEntropyThreshold = 3.8;       // Shannon entropy threshold
+let subdomainCountThreshold = 10;     // Unusual subdomain count
+let queryVolumeThreshold = 50;        // Queries per hour threshold
+let suspiciousTXTThreshold = 10;      // TXT record requests
+
+// Known legitimate long domains (CDNs, telemetry, etc.)
+let excludedDomains = datatable(Domain:string) [
+    "azureedge.net",
+    "cloudfront.net",
+    "akamaiedge.net",
+    "googleusercontent.com",
+    "amazonaws.com",
+    "outlook.office365.com",
+    "windows.net",
+    "digicert.com",
+    "letsencrypt.org",
+    "msftconnecttest.com",
+    "msftncsi.com"
+];
+
+// Suspicious TLDs commonly used in tunneling
+let suspiciousTLDs = datatable(TLD:string, RiskLevel:int) [
+    ".tk", 90,
+    ".ml", 90,
+    ".ga", 90,
+    ".cf", 90,
+    ".gq", 90,
+    ".xyz", 70,
+    ".top", 70,
+    ".club", 60,
+    ".work", 60,
+    ".click", 70
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN QUERY
+// ═══════════════════════════════════════════════════════════════════════════
+
+DnsEvents
+| where TimeGenerated > ago(lookbackPeriod)
+| where isnotempty(Name) or isnotempty(QueryName)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIELD NORMALIZATION - Handle different DNS data sources
+// ─────────────────────────────────────────────────────────────────────────
+| extend QueryName = case(
+    isnotempty(Name), tolower(Name),
+    isnotempty(QueryName), tolower(QueryName),
+    ""
+)
+| extend ClientIP = case(
+    isnotempty(ClientIP), ClientIP,
+    isnotempty(SourceIP), SourceIP,
+    ""
+)
+| extend QueryType = case(
+    isnotempty(QueryType), QueryType,
+    isnotempty(RecordType), RecordType,
+    ""
+)
+| extend ResponseCode = case(
+    isnotempty(ResponseCode), ResponseCode,
+    isnotempty(ResultCode), ResultCode,
+    ""
+)
+
+| where isnotempty(QueryName)
+| where QueryName !startswith "_"  // Exclude SRV records
+
+// ─────────────────────────────────────────────────────────────────────────
+// DOMAIN PARSING & BASIC METRICS
+// ─────────────────────────────────────────────────────────────────────────
+| extend QueryLength = strlen(QueryName)
+| extend DomainParts = split(QueryName, ".")
+| extend SubdomainCount = array_length(DomainParts) - 2
+| extend TLD = strcat(".", tostring(DomainParts[array_length(DomainParts) - 1]))
+| extend SecondLevelDomain = strcat(
+    tostring(DomainParts[array_length(DomainParts) - 2]), 
+    ".", 
+    tostring(DomainParts[array_length(DomainParts) - 1])
+)
+
+// Extract full subdomain portion (everything before SLD)
+| extend SubdomainFull = case(
+    SubdomainCount > 0, 
+    substring(QueryName, 0, strlen(QueryName) - strlen(SecondLevelDomain) - 1),
+    ""
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENTROPY CALCULATION - Detect randomness/encoding
+// ─────────────────────────────────────────────────────────────────────────
+// Shannon entropy function (higher = more random)
+| extend SubdomainBytes = extract_all(@"[a-z0-9]", SubdomainFull)
+| mv-expand SubdomainBytes to typeof(string)
+| summarize 
+    CharFreq = count() 
+    by QueryName, ClientIP, QueryType, ResponseCode, TimeGenerated, 
+       QueryLength, SubdomainCount, TLD, SecondLevelDomain, SubdomainFull, SubdomainBytes
+| summarize 
+    CharCounts = make_bag(pack(tostring(SubdomainBytes), CharFreq)),
+    TotalChars = sum(CharFreq)
+    by QueryName, ClientIP, QueryType, ResponseCode, TimeGenerated,
+       QueryLength, SubdomainCount, TLD, SecondLevelDomain, SubdomainFull
+
+| extend EntropyCalc = bag_keys(CharCounts)
+| mv-expand EntropyCalc to typeof(string)
+| extend CharProb = todouble(CharCounts[EntropyCalc]) / todouble(TotalChars)
+| extend EntropyComponent = CharProb * log2(CharProb) * -1
+| summarize 
+    Entropy = sum(EntropyComponent)
+    by QueryName, ClientIP, QueryType, ResponseCode, TimeGenerated,
+       QueryLength, SubdomainCount, TLD, SecondLevelDomain, SubdomainFull
+
+// ─────────────────────────────────────────────────────────────────────────
+// PATTERN DETECTION - Encoding indicators
+// ─────────────────────────────────────────────────────────────────────────
+| extend HasBase64Pattern = SubdomainFull matches regex @"^[A-Za-z0-9+/=]{20,}$"
+| extend HasHexPattern = SubdomainFull matches regex @"^[0-9a-f]{32,}$"
+| extend HasBase32Pattern = SubdomainFull matches regex @"^[A-Z2-7]{20,}={0,6}$"
+| extend HasNumericHeavy = SubdomainFull matches regex @"[0-9]{10,}"
+| extend HasRepeatingChars = SubdomainFull matches regex @"(.)\1{4,}"
+
+// Consecutive subdomain labels (common in tunneling)
+| extend HasManyLabels = SubdomainCount >= subdomainCountThreshold
+
+// Unusual character distribution
+| extend VowelConsonantRatio = todouble(countof(SubdomainFull, @"[aeiou]")) / 
+                                todouble(strlen(SubdomainFull) + 1)
+| extend IsLowVowelRatio = VowelConsonantRatio < 0.15
+
+// ─────────────────────────────────────────────────────────────────────────
+// SUSPICIOUS QUERY TYPE DETECTION
+// ─────────────────────────────────────────────────────────────────────────
+| extend IsSuspiciousType = QueryType in ("TXT", "NULL", "PRIVATE", "ANY")
+| extend IsUncommonType = QueryType in ("AAAA", "MX", "CNAME") and QueryLength > 60
+
+// ─────────────────────────────────────────────────────────────────────────
+// FILTER - Initial suspicious indicators
+// ─────────────────────────────────────────────────────────────────────────
+| where QueryLength >= minQueryLength
+    or Entropy >= highEntropyThreshold
+    or HasManyLabels
+    or IsSuspiciousType
+    or HasBase64Pattern
+    or HasHexPattern
+
+// Exclude known legitimate domains
+| where not(SecondLevelDomain has_any (excludedDomains))
+
+// ─────────────────────────────────────────────────────────────────────────
+// AGGREGATION - Temporal and client analysis
+// ─────────────────────────────────────────────────────────────────────────
+| summarize
+    // Volume metrics
+    TotalQueries = count(),
+    UniqueClients = dcount(ClientIP),
+    UniqueQueryTypes = dcount(QueryType),
+    
+    // Timing analysis
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated),
+    QueriesPerHour = count() by bin(TimeGenerated, 1h),
+    
+    // Pattern metrics
+    AvgQueryLength = avg(QueryLength),
+    MaxQueryLength = max(QueryLength),
+    AvgEntropy = avg(Entropy),
+    MaxEntropy = max(Entropy),
+    AvgSubdomainCount = avg(SubdomainCount),
+    
+    // Detection flags
+    HasBase64Count = countif(HasBase64Pattern),
+    HasHexCount = countif(HasHexPattern),
+    HasBase32Count = countif(HasBase32Pattern),
+    TXTRecordCount = countif(QueryType == "TXT"),
+    NULLRecordCount = countif(QueryType == "NULL"),
+    
+    // Samples for investigation
+    SampleQueries = make_set(QueryName, 5),
+    ClientIPs = make_set(ClientIP, 10),
+    QueryTypes = make_set(QueryType)
+    
+    by SecondLevelDomain, bin(TimeGenerated, 1d)
+
+// ─────────────────────────────────────────────────────────────────────────
+// ADVANCED METRICS
+// ─────────────────────────────────────────────────────────────────────────
+| extend TimeSpanHours = datetime_diff('hour', LastSeen, FirstSeen) + 1
+| extend QueryRate = TotalQueries / todouble(TimeSpanHours)
+
+// Calculate query consistency (tunnels often have regular intervals)
+| extend QueryVariance = stdev(QueriesPerHour)
+| extend IsRegularPattern = QueryVariance < 5 and TotalQueries > 100
+
+// ─────────────────────────────────────────────────────────────────────────
+// RISK SCORING - Multi-factor analysis (0-100)
+// ─────────────────────────────────────────────────────────────────────────
+| extend RiskScore = 0
+
+// Length-based scoring
+| extend RiskScore = case(
+    AvgQueryLength > 100, RiskScore + 25,
+    AvgQueryLength > 80, RiskScore + 20,
+    AvgQueryLength > 60, RiskScore + 15,
+    RiskScore + 10
+)
+
+// Entropy-based scoring
+| extend RiskScore = case(
+    AvgEntropy > 4.5, RiskScore + 25,
+    AvgEntropy > 4.0, RiskScore + 20,
+    AvgEntropy > 3.8, RiskScore + 15,
+    RiskScore
+)
+
+// Encoding pattern scoring
+| extend RiskScore = case(
+    HasBase64Count > TotalQueries * 0.8, RiskScore + 20,
+    HasHexCount > TotalQueries * 0.8, RiskScore + 20,
+    HasBase32Count > TotalQueries * 0.5, RiskScore + 15,
+    RiskScore
+)
+
+// Query type scoring
+| extend RiskScore = iff(TXTRecordCount > suspiciousTXTThreshold, RiskScore + 15, RiskScore)
+| extend RiskScore = iff(NULLRecordCount > 5, RiskScore + 20, RiskScore)
+
+// Volume scoring
+| extend RiskScore = case(
+    QueryRate > 100, RiskScore + 15,
+    QueryRate > 50, RiskScore + 10,
+    RiskScore
+)
+
+// Subdomain complexity scoring
+| extend RiskScore = iff(AvgSubdomainCount >= 10, RiskScore + 15, RiskScore)
+
+// Regular pattern scoring (beaconing)
+| extend RiskScore = iff(IsRegularPattern, RiskScore + 10, RiskScore)
+
+// Client diversity scoring (single client = more suspicious)
+| extend RiskScore = case(
+    UniqueClients == 1 and TotalQueries > 100, RiskScore + 10,
+    UniqueClients <= 3 and TotalQueries > 50, RiskScore + 5,
+    RiskScore
+)
+
+// Cap at 100
+| extend RiskScore = iff(RiskScore > 100, 100, RiskScore)
+
+// ─────────────────────────────────────────────────────────────────────────
+// TLD RISK ADJUSTMENT
+// ─────────────────────────────────────────────────────────────────────────
+| join kind=leftouter suspiciousTLDs on $left.SecondLevelDomain contains $right.TLD
+| extend RiskScore = iff(isnotempty(RiskLevel), RiskScore + (RiskLevel / 10), RiskScore)
+| extend RiskScore = iff(RiskScore > 100, 100, RiskScore)
+
+// ─────────────────────────────────────────────────────────────────────────
+// SEVERITY CLASSIFICATION
+// ─────────────────────────────────────────────────────────────────────────
+| extend Severity = case(
+    RiskScore >= 85, "Critical",
+    RiskScore >= 70, "High",
+    RiskScore >= 55, "Medium",
+    "Low"
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// TUNNELING TECHNIQUE CLASSIFICATION
+// ─────────────────────────────────────────────────────────────────────────
+| extend SuspectedTechnique = case(
+    TXTRecordCount > suspiciousTXTThreshold, "TXT Record Data Exfiltration",
+    NULLRecordCount > 5, "NULL Record Tunneling",
+    HasBase64Count > TotalQueries * 0.7, "Base64 Encoded Tunneling",
+    HasHexCount > TotalQueries * 0.7, "Hex Encoded Tunneling",
+    IsRegularPattern and QueryRate > 50, "DNS Beaconing / C2",
+    AvgSubdomainCount >= 15, "Subdomain Label Tunneling",
+    AvgEntropy > 4.5, "High Entropy Data Exfiltration",
+    "Generic DNS Tunneling"
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// RECOMMENDATIONS
+// ─────────────────────────────────────────────────────────────────────────
+| extend Recommendation = case(
+    RiskScore >= 85, "CRITICAL: Block domain immediately, isolate affected hosts, capture PCAP for forensics",
+    RiskScore >= 70, "HIGH: Investigate client activity, analyze full DNS logs, check for data exfiltration",
+    RiskScore >= 55, "MEDIUM: Monitor domain, validate legitimate use case, review firewall logs",
+    "LOW: Continue monitoring, document baseline behavior"
+)
+
+// ─────────────────────────────────────────────────────────────────────────
+// FILTERING - Apply minimum thresholds
+// ─────────────────────────────────────────────────────────────────────────
+| where RiskScore >= 50 or TotalQueries > queryVolumeThreshold
+
+// ─────────────────────────────────────────────────────────────────────────
+// OUTPUT - Analyst-ready format
+// ─────────────────────────────────────────────────────────────────────────
+| project
+    Severity,
+    RiskScore,
+    SuspectedTechnique,
+    AlertTime = LastSeen,
+    Domain = SecondLevelDomain,
+    TotalQueries,
+    QueryRate,
+    UniqueClients,
+    TimeSpanHours,
+    
+    // Key indicators
+    AvgQueryLength,
+    MaxQueryLength,
+    AvgEntropy,
+    MaxEntropy,
+    AvgSubdomainCount,
+    
+    // Detection flags
+    HasBase64Count,
+    HasHexCount,
+    TXTRecordCount,
+    NULLRecordCount,
+    IsRegularPattern,
+    
+    // Context
+    FirstSeen,
+    LastSeen,
+    ClientIPs,
+    QueryTypes,
+    SampleQueries,
+    
+    Recommendation
+    
+| order by RiskScore desc, TotalQueries desc
